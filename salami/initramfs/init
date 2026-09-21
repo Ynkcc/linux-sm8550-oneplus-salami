@@ -1,0 +1,124 @@
+#!/bin/sh
+# salami initramfs: minimal bring-up init.
+# 流程：M1 init -> M2 mounts -> M3 gadget(ACM+RNDIS) -> M5 shells -> R1 switch_root
+# 历史诊断段（D1~D7）已移除；需要时在 Arch 下用 dmesg / ssh 查看。
+
+export PATH=/bin:/sbin
+
+mount -t proc none /proc 2>/dev/null || true
+mount -t sysfs none /sys 2>/dev/null || true
+mount -t devtmpfs none /dev 2>/dev/null || true
+
+if [ -c /dev/console ]; then
+    exec < /dev/console > /dev/console 2>&1
+else
+    mknod -m 600 /dev/console c 5 1 2>/dev/null || true
+    exec < /dev/console > /dev/console 2>&1
+fi
+
+/bin/busybox --install -s /bin 2>/dev/null || true
+
+echo
+echo
+echo "INIT_VER: @VER@"
+echo "<6>M1: init alive" > /dev/kmsg 2>/dev/null || true
+echo "M1: init alive"
+
+mkdir -p /config
+mount -t configfs none /config
+mkdir -p /run /dev/pts
+mount -t devpts none /dev/pts 2>/dev/null || true
+hostname salami 2>/dev/null || true
+echo "<6>M2: mounts done" > /dev/kmsg 2>/dev/null || true
+echo "M2: mounts done"
+
+echo "M3: gadget"
+GADGET=/config/usb_gadget/g1
+if mkdir "$GADGET" 2>/dev/null; then
+    echo 0x18d1 > "$GADGET/idVendor"
+    echo 0x4ee7 > "$GADGET/idProduct"
+    mkdir -p "$GADGET/strings/0x409"
+    echo salami > "$GADGET/strings/0x409/product"
+    mkdir "$GADGET/configs/c.1"
+    mkdir "$GADGET/functions/acm.0"
+    mkdir "$GADGET/functions/rndis.0"
+    ln -s "$GADGET/functions/acm.0" "$GADGET/configs/c.1/acm.0"
+    ln -s "$GADGET/functions/rndis.0" "$GADGET/configs/c.1/rndis.0"
+    UDC=""
+    i=0
+    while [ $i -lt 15 ]; do
+        UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
+        [ -n "$UDC" ] && break
+        sleep 1
+        i=$((i+1))
+    done
+    if [ -n "$UDC" ]; then
+        echo "$UDC" > "$GADGET/UDC"
+        echo "M4: gadget ACM+RNDIS bound to $UDC"
+        # RNDIS 静态 IP：主机侧 10.15.0.1 做 NAT/DHCP
+        sleep 2
+        ip addr add 10.15.0.2/24 dev usb0 2>/dev/null || ip addr add 10.15.0.2/24 dev rndis0 2>/dev/null
+        ip link set usb0 up 2>/dev/null || ip link set rndis0 up 2>/dev/null
+        ip route replace default via 10.15.0.1 dev usb0 2>/dev/null || ip route replace default via 10.15.0.1 dev rndis0 2>/dev/null
+    else
+        echo "M4: no UDC after 15s"
+    fi
+else
+    echo "M4: gadget mkdir failed"
+fi
+
+echo "M5: shells"
+i=0
+while [ $i -lt 15 ] && [ ! -c /dev/ttyGS0 ]; do
+    sleep 1
+    i=$((i+1))
+done
+# shell 绑定所有 gadget 串口（规避主机侧 ttyACM 枚举漂移）
+for g in /dev/ttyGS*; do
+    [ -c "$g" ] && setsid cttyhack sh -i < "$g" > "$g" 2>&1 &
+done
+# 网络后门：RNDIS 上起 telnetd，主机侧 telnet 10.15.0.2 即得 shell
+[ -x /bin/telnetd ] && telnetd -l /bin/sh
+[ -c /dev/ttyMSM0 ] && setsid cttyhack sh -i < /dev/ttyMSM0 > /dev/ttyMSM0 2>&1 &
+
+# ---- R1: 挂载根分区并 switch_root ----
+# 根分区格式：btrfs（subvol=@，当前方案）或 ext4（历史镜像），按 sda* 顺序探测。
+# 维护模式：若根分区上存在 /etc/salami-maint，则不 switch_root，停在 initramfs
+# 救援壳（telnet 10.15.0.2 / 全部 ttyGS*），用于分区调整、rootfs 重装等离线操作。
+ROOT=""
+ROOTFS=""
+mkdir -p /newroot
+for d in /sys/block/sda/sda*; do
+    n=$(basename "$d")
+    for spec in "btrfs|-o ro,subvol=@" "ext4|-o ro"; do
+        fs=${spec%%|*}
+        opts=${spec#*|}
+        if mount -t "$fs" $opts "/dev/$n" /newroot 2>/dev/null; then
+            if [ -x /newroot/sbin/init ] || [ -x /newroot/usr/bin/systemd ]; then
+                ROOT=$n
+                ROOTFS=$fs
+                break 2
+            fi
+            umount /newroot
+        fi
+    done
+done
+if [ -n "$ROOT" ]; then
+    if [ -e /newroot/etc/salami-maint ]; then
+        echo "R1: maintenance flag on /dev/$ROOT ($ROOTFS) -> stay in initramfs (rescue shell, telnet 10.15.0.2)"
+    else
+        echo "R1: rootfs on /dev/$ROOT ($ROOTFS), switch_root"
+        mount -o remount,rw /newroot
+        exec switch_root /newroot /sbin/init
+    fi
+else
+    echo "R1: no rootfs found, staying in initramfs (rescue shell on ttyGS*/ttyMSM0, telnet 10.15.0.2)"
+fi
+mkdir -p /sys/fs/pstore
+mount -t pstore none /sys/fs/pstore 2>/dev/null || true
+echo "D7: prev-boot panic tail:"
+tail -30 /sys/fs/pstore/console-ramoops-0 2>/dev/null | fold -w 48
+while :; do
+    sleep 3600
+    sh
+done

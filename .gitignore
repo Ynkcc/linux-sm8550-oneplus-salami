@@ -194,3 +194,7 @@ sphinx_*/
 
 # bc language scripts (not LLVM bitcode)
 !kernel/time/timeconst.bc
+
+# salami initramfs build artifacts — 跟踪它们会导致 checkout 带回陈旧 cpio、
+# 内核嵌入旧 initramfs（陈旧 initramfs 陷阱），故仅保留本地构建产物
+salami/initramfs/out/

@@ -528,6 +528,15 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 			  rsc_name, pmic_id, rpmh_data->index);
 	}
 
+	/* salami bring-up: cmd_db_read_addr() returns 0 for ANY cmd-db error,
+	 * including -EPROBE_DEFER while the cmd-db platform device has not been
+	 * probed yet. That used to surface as -ENODEV ("could not find RPMh
+	 * address") which fails the probe permanently. Check readiness
+	 * explicitly so we defer and retry instead. */
+	ret = cmd_db_ready();
+	if (ret)
+		return dev_err_probe(dev, ret, "cmd-db not ready\n");
+
 	vreg->addr = cmd_db_read_addr(rpmh_resource_name);
 	if (!vreg->addr) {
 		dev_err(dev, "%pOFn: could not find RPMh address for resource %s\n",

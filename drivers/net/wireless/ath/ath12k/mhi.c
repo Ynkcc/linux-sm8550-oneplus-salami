@@ -251,7 +251,9 @@ int ath12k_mhi_register(struct ath12k_pci *ab_pci)
 	if (!test_bit(ATH12K_PCI_FLAG_MULTI_MSI_VECTORS, &ab_pci->flags))
 		mhi_ctrl->irq_flags = IRQF_SHARED | IRQF_NOBALANCING;
 
-	mhi_ctrl->iova_start = 0;
+	/* 对齐下游 CNSS：固定 IOVA 池 0xa0000000 起（salami stock iommu-dma-addr-pool）。
+	 * 实验：验证 WCN7850 SBL/AMSS 是否对 IOVA 范围有假设（BHI 阶段 fatal 排查） */
+	mhi_ctrl->iova_start = 0xa0000000;
 	mhi_ctrl->iova_stop = ab_pci->dma_mask;
 	mhi_ctrl->sbl_size = SZ_512K;
 	mhi_ctrl->seg_len = SZ_512K;
